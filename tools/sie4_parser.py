@@ -1,18 +1,19 @@
-# sie4_parser.py
+# tools/sie4_parser.py
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Dict, List, Optional, Tuple, Iterable, Union, IO
 from datetime import date, datetime
+from pathlib import Path
 import re
 
 try:
-    import pandas as pd  # Optional, but handy
+    import pandas as pd  # valfritt; krävs bara för DataFrame-hjälpare
 except ImportError:
     pd = None
 
 
 # ---------------------------
-# Domain model
+# Domänmodell
 # ---------------------------
 
 @dataclass
@@ -32,12 +33,14 @@ class Account:
             node = node.parent
         return list(reversed(chain))
 
+
 @dataclass
 class Transaction:
     account: str
     amount: float
-    dim: Optional[Tuple[str, ...]] = None  # placeholder for dimensions like object/enhet
+    dim: Optional[Tuple[str, ...]] = None  # råa “dimensioner”/metadata
     text: Optional[str] = None
+
 
 @dataclass
 class Voucher:
@@ -48,11 +51,13 @@ class Voucher:
     reg_date: Optional[date] = None
     transactions: List[Transaction] = field(default_factory=list)
 
+
 @dataclass
 class RAR:  # Räkenskapsår
     idx: int
     start: date
     end: date
+
 
 @dataclass
 class Company:
@@ -65,6 +70,7 @@ class Company:
     rars: List[RAR] = field(default_factory=list)
     accounts: Dict[str, Account] = field(default_factory=dict)
     vouchers: List[Voucher] = field(default_factory=list)
+    source_encoding: Optional[str] = None  # <-- ny: vilken encoding som lyckades
 
     # --- Pandas helpers ---
     def to_pandas_accounts(self):
@@ -121,9 +127,6 @@ class Company:
         return df
 
     def to_pandas_monthly_by_account(self):
-        """
-        Sum of amounts per month and account (debit positive, credit negative per SIE sign).
-        """
         if pd is None:
             raise ImportError("pandas is not installed")
         tx = self.to_pandas_transactions()
@@ -135,7 +138,6 @@ class Company:
                  .pivot(index="account", columns="month", values="amount")
                  .fillna(0.0)
                  .sort_index())
-        # Optionally join account names:
         acc = self.to_pandas_accounts().set_index("account")[["name"]]
         return acc.join(pivot, how="left").fillna(0.0)
 
@@ -146,55 +148,99 @@ class Company:
 
 class SIE4Parser:
     """
-    Minimal but robust SIE4 parser.
-
-    Supports:
-      - #FLAGGA, #PROGRAM, #FORMAT, #GEN, #SIETYP
-      - #ORGNR, #FNAMN
-      - #RAR
-      - #KONTO, #SRU
-      - #IB, #UB
-      - #VER { #TRANS ... }
+    Robust SIE4-parser.
+    Stöd: #FLAGGA, #PROGRAM, #FORMAT, #GEN, #SIETYP, #ORGNR, #FNAMN, #RAR,
+          #KONTO, #SRU, #IB, #UB, #VER { #TRANS ... }.
+    Tålig mot extra tokens/klamrar och olika decimaltecken.
     """
+
+    _num_re = re.compile(r'^[+-]?\d+(?:[.,]\d+)?$')
+
+    # Standardordning på encodings vi testar:
+    DEFAULT_ENCODINGS: Tuple[str, ...] = ("utf-8", "cp865", "cp1252", "latin1")
 
     def __init__(self, infer_account_hierarchy: bool = True):
         self.infer_account_hierarchy = infer_account_hierarchy
 
-    def parse(self, path: str, encoding_candidates: Iterable[str] = ("cp1252", "latin1", "utf-8")) -> Company:
-        text = self._read_text_with_guess(path, encoding_candidates)
+    # --- Publika indata-varianter ---
+
+    def parse_text(self, text: str) -> Company:
         lines = self._normalize_lines(text)
+        company = self._parse_lines(lines)
+        # text-sträng: encoding okänd (lämna None)
+        return company
+
+    def parse_bytes(self, data: bytes,
+                    encoding_candidates: Iterable[str] = DEFAULT_ENCODINGS) -> Company:
+        text, enc = self._decode_with_guess(data, encoding_candidates)
+        company = self.parse_text(text)
+        company.source_encoding = enc
+        return company
+
+    def parse_file(self, path: Union[str, Path],
+                   encoding_candidates: Iterable[str] = DEFAULT_ENCODINGS) -> Company:
+        p = Path(path)
+        data = p.read_bytes()
+        return self.parse_bytes(data, encoding_candidates)
+
+    def parse(self, source: Union[str, bytes, Path, IO[str], IO[bytes]]) -> Company:
+        """
+        Autodetekterar:
+          - str: om fil finns -> fil, annars behandlas som SIE-text
+          - bytes: tolkas via parse_bytes
+          - Path: parse_file
+          - file-like: read() -> bytes eller str
+        """
+        if hasattr(source, "read"):  # file-like
+            content = source.read()
+            if isinstance(content, bytes):
+                return self.parse_bytes(content, self.DEFAULT_ENCODINGS)
+            return self.parse_text(str(content))
+
+        if isinstance(source, Path):
+            return self.parse_file(source, self.DEFAULT_ENCODINGS)
+
+        if isinstance(source, (bytes, bytearray)):
+            return self.parse_bytes(bytes(source), self.DEFAULT_ENCODINGS)
+
+        if isinstance(source, str):
+            p = Path(source)
+            if p.exists() and p.is_file():
+                return self.parse_file(p, self.DEFAULT_ENCODINGS)
+            return self.parse_text(source)
+
+        raise TypeError(f"Unsupported source type: {type(source)!r}")
+
+    # --- Intern parsning ---
+
+    def _parse_lines(self, lines: List[str]) -> Company:
         company = Company()
-        ctx_in_ver_block = False
         current_voucher: Optional[Voucher] = None
 
         for raw in lines:
             line = raw.strip()
-            if not line or line.startswith(";;"):  # comment line
+            if not line or line.startswith(";;"):  # kommentar
                 continue
 
-            # Handle block delimiters
+            # block-delimiter
             if line == "{":
-                ctx_in_ver_block = True
+                # Vi väntar på #TRANS-rader efter #VER
                 continue
             if line == "}":
-                ctx_in_ver_block = False
                 if current_voucher:
                     company.vouchers.append(current_voucher)
                     current_voucher = None
                 continue
 
             if not line.startswith("#"):
-                # Some files may have non-command lines; skip safely
                 continue
 
             cmd, args = self._split_command(line)
 
             if cmd == "#FLAGGA":
-                pass  # ignore
+                pass
             elif cmd == "#PROGRAM":
-                # #PROGRAM "Name with spaces" 1.0 20240305
-                program = " ".join(a for a in args if a)
-                company.program = program.strip()
+                company.program = " ".join(a for a in args if a).strip()
             elif cmd == "#FORMAT":
                 company.format = args[0] if args else None
             elif cmd == "#GEN":
@@ -206,34 +252,37 @@ class SIE4Parser:
             elif cmd == "#FNAMN":
                 company.name = self._strip_quotes(args[0]) if args else None
             elif cmd == "#RAR":
-                # #RAR idx yyyymmdd yyyymmdd
                 rar = RAR(idx=int(args[0]),
                           start=self._parse_date(args[1]),
                           end=self._parse_date(args[2]))
                 company.rars.append(rar)
             elif cmd == "#KONTO":
-                # #KONTO 3001 "Försäljning"
                 acc_no = args[0]
                 acc_name = self._strip_quotes(args[1]) if len(args) > 1 else ""
                 acc = company.accounts.get(acc_no) or Account(number=acc_no)
                 acc.name = acc_name or acc.name
                 company.accounts[acc_no] = acc
             elif cmd == "#SRU":
-                # #SRU 3001 7200
                 if len(args) >= 2:
                     acc_no, sru = args[0], args[1]
                     acc = company.accounts.get(acc_no) or Account(number=acc_no)
                     acc.sru = sru
                     company.accounts[acc_no] = acc
             elif cmd == "#IB":
-                # #IB 1930 10000.00
-                acc_no, amount = args[0], float(args[1].replace(",", "."))
+                # #IB <konto> <belopp> [extra]
+                acc_no = args[0]
+                amount = self._first_number(args, start_idx=1)
+                if amount is None:
+                    continue
                 acc = company.accounts.get(acc_no) or Account(number=acc_no)
                 acc.opening_balance = amount
                 company.accounts[acc_no] = acc
             elif cmd == "#UB":
-                # #UB 1930 20000.00
-                acc_no, amount = args[0], float(args[1].replace(",", "."))
+                # #UB <konto> <belopp> [extra]
+                acc_no = args[0]
+                amount = self._first_number(args, start_idx=1)
+                if amount is None:
+                    continue
                 acc = company.accounts.get(acc_no) or Account(number=acc_no)
                 acc.closing_balance = amount
                 company.accounts[acc_no] = acc
@@ -246,56 +295,51 @@ class SIE4Parser:
                 reg_date = self._parse_date(args[4]) if len(args) > 4 else None
                 current_voucher = Voucher(series=series, number=number, date=vdate, text=text, reg_date=reg_date)
             elif cmd == "#TRANS":
-                # #TRANS 1930 -1000.00 "text" [dim...]
+                # #TRANS <konto> <belopp> ["text"] [dim...]
                 if current_voucher is None:
-                    # Malformed file; skip gracefully
+                    # Malformad fil; hoppa över
                     continue
                 acc_no = args[0]
-                amount = float(args[1].replace(",", "."))
-                # remaining args could be "text" and/or dimensions; we only capture text if quoted
+                amount = self._first_number(args, start_idx=1)
+                if amount is None:
+                    # hoppa över trasig rad i stället för att krascha
+                    continue
+
+                # Hämta citerad text om den finns
                 tx_text = None
-                if len(args) >= 3 and self._is_quoted(args[2]):
-                    tx_text = self._strip_quotes(args[2])
-                    dims = tuple(args[3:]) if len(args) > 3 else None
-                else:
-                    dims = tuple(args[2:]) if len(args) > 2 else None
-                current_voucher.transactions.append(Transaction(account=acc_no, amount=amount, dim=dims, text=tx_text))
+                for t in args[1:]:
+                    if self._is_quoted(t):
+                        tx_text = self._strip_quotes(t)
+                        break
+
+                # Grovt bevara övriga icke-tals/icke-citerade tokens som "dimensioner"
+                dims = tuple(a for a in args[1:]
+                             if not self._num_re.match(a)
+                             and not self._is_quoted(a)
+                             and a not in ("{", "}", "{}"))
+
+                current_voucher.transactions.append(
+                    Transaction(account=acc_no, amount=float(str(amount).replace(",", ".")),
+                                dim=dims or None, text=tx_text)
+                )
             else:
-                # Ignore other commands for now (#RES, #KUND, #LEVERANTOR, etc.)
+                # Ignorera övriga taggar tills vidare (#RES, #OBJEKT, #KUND, ...)
                 pass
 
-        # Build inferred account tree if requested
         if self.infer_account_hierarchy and company.accounts:
             self._build_account_hierarchy(company.accounts)
-
         return company
 
     # ---------------------------
-    # Helpers
+    # Hjälpare
     # ---------------------------
 
     @staticmethod
-    def _read_text_with_guess(path: str, encodings: Iterable[str]) -> str:
-        last_exc = None
-        for enc in encodings:
-            try:
-                with open(path, "r", encoding=enc, errors="strict") as f:
-                    return f.read()
-            except Exception as e:
-                last_exc = e
-                continue
-        # fallback with replacement to at least get something
-        with open(path, "r", encoding="latin1", errors="replace") as f:
-            return f.read()
-
-    @staticmethod
     def _normalize_lines(text: str) -> List[str]:
-        # Some SIE files have CRLF or exotic endings; normalize
         return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
     @staticmethod
     def _parse_date(s: str) -> date:
-        # yyyymmdd
         s = re.sub(r'[^0-9]', '', s)
         return datetime.strptime(s, "%Y%m%d").date()
 
@@ -312,13 +356,8 @@ class SIE4Parser:
     @staticmethod
     def _split_command(line: str) -> Tuple[str, List[str]]:
         """
-        Split a SIE command line into (command, args) with quote-awareness.
-
-        Example:
-          #VER A 1 20240110 "Kundfaktura 1001" 20240110
-          -> ("#VER", ["A","1","20240110","\"Kundfaktura 1001\"","20240110"])
+        Dela upp '#CMD args...' i (cmd, args) med citat-medveten tokenisering.
         """
-        # Find the command token
         m = re.match(r"^(#[A-Z0-9]+)\s*(.*)$", line, re.IGNORECASE)
         if not m:
             return line, []
@@ -327,7 +366,6 @@ class SIE4Parser:
         args: List[str] = []
         i, n = 0, len(rest)
         while i < n:
-            # skip spaces
             while i < n and rest[i].isspace():
                 i += 1
             if i >= n:
@@ -335,8 +373,6 @@ class SIE4Parser:
             if rest[i] in ("'", '"'):
                 q = rest[i]
                 i += 1
-                start = i
-                # read until matching quote
                 buf = []
                 while i < n:
                     ch = rest[i]
@@ -345,83 +381,100 @@ class SIE4Parser:
                     buf.append(ch)
                     i += 1
                 args.append(q + "".join(buf) + q)
-                i += 1  # skip ending quote
+                i += 1  # hoppa över avslutande citat
             else:
-                # read until space
                 start = i
                 while i < n and not rest[i].isspace():
                     i += 1
                 args.append(rest[start:i])
         return cmd.upper(), args
 
+    def _decode_with_guess(self, data: bytes, encodings: Iterable[str]) -> Tuple[str, str]:
+        """
+        Testa flera encodings och returnera (text, lyckad_encoding).
+        Ordningen styrs av DEFAULT_ENCODINGS; inkluderar cp865 för OEM 865.
+        """
+        last_exc = None
+        for enc in encodings:
+            try:
+                text = data.decode(enc)
+                return text, enc
+            except Exception as e:
+                last_exc = e
+                continue
+        # Fallback: latin1 med ersättningstecken, men markera som 'latin1-replace'
+        text = data.decode("latin1", errors="replace")
+        return text, "latin1-replace"
+
+    def _first_number(self, tokens: List[str], start_idx: int = 0) -> Optional[float]:
+        """
+        Hitta första token som ser ut som ett tal (t.ex. -1000,00 eller 1000.00).
+        Ignorerar klammerbrus och icke-numeriska tokens.
+        """
+        for t in tokens[start_idx:]:
+            tt = t.strip()
+            if tt in ('{', '}', '{}'):
+                continue
+            if self._num_re.match(tt):
+                try:
+                    return float(tt.replace(',', '.'))
+                except ValueError:
+                    continue
+        return None
+
     @staticmethod
     def _build_account_hierarchy(accounts: Dict[str, Account]) -> None:
-        """
-        Build parent-child relationships by numeric prefix:
-          - Parent levels: 1-digit, 2-digit, 3-digit
-          - Leaf level: 4-digit (BAS standard), but supports longer
-        """
-        # Ensure all intermediate prefixes exist as synthetic nodes if needed
-        def ensure_account(num: str) -> Account:
-            if num not in accounts:
-                accounts[num] = Account(number=num, name="")
-            return accounts[num]
-
-        # Create parents for each account by prefixes
-        for num in list(accounts.keys()):
-            # Only consider numeric accounts for hierarchy
-            if not num.isdigit():
-                continue
-            prefixes = [num[:1], num[:2], num[:3]]
-            child = ensure_account(num)
-            for p in prefixes:
-                if p == num:
-                    continue
-                parent = ensure_account(p)
-                # Link if not already linked and doesn't create cycle
-                if child.parent is None and parent is not child:
-                    # pick the deepest existing parent (3 -> 2 -> 1)
-                    # We’ll assign after loop to the deepest valid
-                    pass
-
-        # Assign actual parents preferring deepest prefix that exists
+        # Skapa parent/child med numeriska prefix (BAS)
         for num, acc in list(accounts.items()):
             if not num.isdigit() or len(num) == 1:
                 continue
-            candidates = [num[:i] for i in (len(num) - 1, len(num) - 2, len(num) - 3, 1, 2, 3) if i > 0]
-            # prefer 3-digit, then 2, then 1
-            pref = []
             if len(num) >= 4:
-                pref = [num[:3], num[:2], num[:1]]
+                prefs = [num[:3], num[:2], num[:1]]
             elif len(num) == 3:
-                pref = [num[:2], num[:1]]
-            elif len(num) == 2:
-                pref = [num[:1]]
-            for p in pref:
-                if p in accounts and p != num:
-                    parent = accounts[p]
-                    if acc.parent is None:
-                        acc.parent = parent
-                        if acc not in parent.children:
-                            parent.children.append(acc)
-                        break
-        # Ensure top-level nodes (1-digit) have no parent:
+                prefs = [num[:2], num[:1]]
+            else:  # len == 2
+                prefs = [num[:1]]
+            for p in prefs:
+                parent = accounts.get(p)
+                if parent and parent is not acc and acc.parent is None:
+                    acc.parent = parent
+                    if acc not in parent.children:
+                        parent.children.append(acc)
+                    break
+        # Top-nivå (1-siffriga) saknar parent
         for num, acc in accounts.items():
             if num.isdigit() and len(num) == 1:
-                acc.parent = None  # root
+                acc.parent = None
+
 
 # ---------------------------
-# Example usage (remove if importing as a library)
+# Snabb CLI-test (frivilligt)
 # ---------------------------
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) < 2:
-        print("Usage: python sie4_parser.py <path_to_sie4_file>")
-        sys.exit(1)
     parser = SIE4Parser()
-    company = parser.parse(sys.argv[1])
-    print(f"Company: {company.name} ({company.orgnr}) – SIETYP {company.sietyp}")
-    print(f"Accounts: {len(company.accounts)} | Vouchers: {len(company.vouchers)}")
+    if len(sys.argv) == 2:
+        src = sys.argv[1]
+        company = parser.parse(src)  # funkar med filväg eller SIE-text
+    else:
+        demo = """#SIETYP 4
+#FNAMN "Demo ÅÄÖ AB"
+#ORGNR 556000-0000
+#RAR 1 20240101 20241231
+#KONTO 3001 "Försäljning åäö"
+#KONTO 1930 "Bank"
+#IB 1930 {} 10000,00
+#VER A 1 20240301 "Faktura 1001 – ÅÄÖ" 20240301
+{
+#TRANS 1930 {} -1000,00 "Inbetalning åäö" {OBJEKT 1 10}
+#TRANS 3001 1000.00 "Intäkt åäö"
+}
+#UB 1930 9000,00 {}
+"""
+        # Simulera OEM865: koda till cp865-bytes och låt parsern autodetektera
+        data = demo.encode("cp865", errors="replace")
+        company = parser.parse_bytes(data)
+
+    print(f"Company: {company.name} ({company.orgnr}) – SIETYP {company.sietyp} – encoding: {company.source_encoding}")
     if pd:
-        df_tx = company.to_pandas_transactions()
-        print(df_tx.head())
+        print(company.to_pandas_vouchers().head())
